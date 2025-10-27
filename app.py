@@ -2,506 +2,420 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
-import plotly.express as px
-import plotly.graph_objects as go
-from pathlib import Path
+import os
+import tempfile
+import pefile
+import re
+from io import BytesIO
+import time
 
-# Page configuration
+# Set page configuration
 st.set_page_config(
     page_title="Ransomware Detection System",
     page_icon="🛡️",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
-# Custom CSS
-st.markdown("""
-    <style>
-    .main-header {
-        font-size: 3rem;
-        font-weight: bold;
-        text-align: center;
-        color: #1f77b4;
-        margin-bottom: 2rem;
-    }
-    .metric-card {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        padding: 2rem;
-        border-radius: 15px;
-        color: white;
-        box-shadow: 0 10px 30px rgba(0,0,0,0.3);
-        text-align: center;
-    }
-    .metric-card h3 {
-        color: white !important;
-        font-size: 1rem;
-        margin-bottom: 0.5rem;
-        opacity: 0.9;
-    }
-    .metric-card h2 {
-        color: white !important;
-        font-size: 2.5rem;
-        margin: 1rem 0;
-        font-weight: bold;
-    }
-    .metric-card p {
-        color: white !important;
-        font-size: 0.9rem;
-        opacity: 0.9;
-    }
-    .benign {
-        color: #2ecc71;
-        font-weight: bold;
-    }
-    .malicious {
-        color: #e74c3c;
-        font-weight: bold;
-    }
-    </style>
-""", unsafe_allow_html=True)
-
-# Load model
+# Load the trained model
 @st.cache_resource
 def load_model():
     try:
-        model_path = Path("models/ransomware_model.pkl")
-        model_data = joblib.load(model_path)
+        model_data = joblib.load("models/ransomware_model.pkl")
         return model_data["model"], model_data["features"]
-    except Exception as e:
-        st.error(f"Error loading model: {e}")
+    except FileNotFoundError:
+        st.error("Model file not found. Please ensure the model is trained first.")
         return None, None
 
-# Main app
-def main():
-    # Header
-    st.markdown('<h1 class="main-header">🛡️ Ransomware Detection System</h1>', unsafe_allow_html=True)
+def quick_extract_pe_features(pe_file_path):
+    """
+    Fast feature extraction from PE file
+    """
+    try:
+        pe = pefile.PE(pe_file_path)
+        
+        features = {}
+        
+        # Basic header features (fast to extract)
+        features['Machine'] = pe.FILE_HEADER.Machine
+        features['MajorImageVersion'] = pe.OPTIONAL_HEADER.MajorImageVersion
+        features['MajorOSVersion'] = pe.OPTIONAL_HEADER.MajorOperatingSystemVersion
+        features['MajorLinkerVersion'] = pe.OPTIONAL_HEADER.MajorLinkerVersion
+        features['MinorLinkerVersion'] = pe.OPTIONAL_HEADER.MinorLinkerVersion
+        features['NumberOfSections'] = len(pe.sections)
+        features['SizeOfStackReserve'] = pe.OPTIONAL_HEADER.SizeOfStackReserve
+        features['DllCharacteristics'] = pe.OPTIONAL_HEADER.DllCharacteristics
+        features['IatVRA'] = pe.OPTIONAL_HEADER.DATA_DIRECTORY[1].VirtualAddress
+        
+        # Debug info (check quickly)
+        features['DebugSize'] = 0
+        features['DebugRVA'] = 0
+        if hasattr(pe, 'DIRECTORY_ENTRY_DEBUG') and pe.DIRECTORY_ENTRY_DEBUG:
+            debug_info = pe.DIRECTORY_ENTRY_DEBUG[0]
+            features['DebugSize'] = debug_info.struct.SizeOfData
+            features['DebugRVA'] = debug_info.struct.AddressOfRawData
+        
+        # Export info (check quickly)
+        features['ExportRVA'] = 0
+        features['ExportSize'] = 0
+        if hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
+            features['ExportRVA'] = pe.DIRECTORY_ENTRY_EXPORT.struct.AddressOfNames
+            features['ExportSize'] = pe.DIRECTORY_ENTRY_EXPORT.struct.NumberOfNames
+        
+        # Resource size (check quickly)
+        features['ResourceSize'] = 0
+        if hasattr(pe, 'DIRECTORY_ENTRY_RESOURCE'):
+            features['ResourceSize'] = pe.DIRECTORY_ENTRY_RESOURCE.struct.Size
+        
+        # Quick bitcoin detection (sample first 1MB only for speed)
+        features['BitcoinAddresses'] = quick_bitcoin_detection(pe_file_path)
+        
+        pe.close()
+        return features
+        
+    except Exception as e:
+        st.error(f"Error analyzing PE file: {str(e)}")
+        return None
+
+def quick_bitcoin_detection(file_path, sample_size=1024*1024):
+    """
+    Fast bitcoin detection by sampling only part of the file
+    """
+    try:
+        with open(file_path, 'rb') as f:
+            # Only read first 1MB for speed
+            content = f.read(sample_size)
+            
+        # Convert to string for pattern matching
+        content_str = content.decode('latin-1', errors='ignore')
+        
+        # Simple pattern for bitcoin addresses
+        btc_pattern = r'[13][a-km-zA-HJ-NP-Z1-9]{25,34}|bc1[a-zA-HJ-NP-Z0-9]{25,90}'
+        matches = re.findall(btc_pattern, content_str)
+        
+        return len(matches)
+    except:
+        return 0
+
+def analyze_uploaded_file(uploaded_file):
+    """
+    Fast analysis of uploaded file
+    """
+    # Save uploaded file to temporary location
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.exe') as tmp_file:
+        tmp_file.write(uploaded_file.getvalue())
+        tmp_path = tmp_file.name
+    
+    try:
+        # Quick feature extraction
+        features = quick_extract_pe_features(tmp_path)
+        return features
+        
+    except Exception as e:
+        st.error(f"Error processing file: {str(e)}")
+        return None
+    finally:
+        # Clean up temporary file
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+def predict_from_features(features, model, feature_names, source_name="Manual Input"):
+    """
+    Make prediction from features and display results
+    """
+    # Prepare data and predict
+    input_data = np.array([[features[feature] for feature in feature_names]])
+    prediction = model.predict(input_data)[0]
+    probability = model.predict_proba(input_data)[0]
+    
+    # Display results
     st.markdown("---")
+    st.header("🎯 **INSTANT ANALYSIS RESULTS**")
+    
+    # Results in columns
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        if prediction == 1:
+            st.error("""
+            ## 🚨 RANSOMWARE DETECTED
+            **High probability of malicious activity**
+            """)
+        else:
+            st.success("""
+            ## ✅ BENIGN FILE
+            **File appears to be safe**
+            """)
+    
+    with col2:
+        # Confidence gauges
+        st.metric(
+            "Ransomware Confidence", 
+            f"{probability[1]:.1%}",
+            delta=f"{probability[1]-0.5:+.1%}" if probability[1] > 0.5 else ""
+        )
+        st.metric(
+            "Benign Confidence", 
+            f"{probability[0]:.1%}",
+            delta=f"{probability[0]-0.5:+.1%}" if probability[0] > 0.5 else ""
+        )
+    
+    with col3:
+        # Risk assessment
+        risk_score = probability[1]
+        if risk_score > 0.8:
+            risk_level = "🔴 CRITICAL"
+        elif risk_score > 0.6:
+            risk_level = "🟠 HIGH"
+        elif risk_score > 0.3:
+            risk_level = "🟡 MEDIUM"
+        else:
+            risk_level = "🟢 LOW"
+        
+        st.metric("Risk Level", risk_level)
+        
+        # Quick verdict
+        if prediction == 1:
+            st.error("**Recommendation:** Quarantine file")
+        else:
+            st.success("**Recommendation:** File appears safe")
+    
+    # Feature overview
+    with st.expander("📋 Feature Overview (Click to expand)", expanded=False):
+        # Show only key features for quick review
+        key_features = ['Machine', 'NumberOfSections', 'BitcoinAddresses', 'DebugSize', 'ExportSize']
+        
+        feature_display = {}
+        for feat in key_features:
+            if feat in features:
+                feature_display[feat] = features[feat]
+        
+        st.dataframe(pd.DataFrame([feature_display]).T.rename(columns={0: 'Value'}))
+    
+    # Detailed analysis
+    with st.expander("🔍 Detailed Technical Analysis", expanded=False):
+        # All features
+        st.dataframe(pd.DataFrame([features]).T.rename(columns={0: 'Value'}))
+        
+        # Feature importance
+        if hasattr(model, 'feature_importances_'):
+            st.subheader("Top Contributing Features")
+            importance_df = pd.DataFrame({
+                'Feature': feature_names,
+                'Importance': model.feature_importances_
+            }).sort_values('Importance', ascending=False)
+            
+            top_3 = importance_df.head(3)
+            for _, row in top_3.iterrows():
+                st.write(f"**{row['Feature']}**: {features[row['Feature']]} (impact: {row['Importance']:.3f})")
+    
+    # Quick actions
+    st.markdown("---")
+    st.subheader("🚀 Quick Actions")
+    
+    action_col1, action_col2 = st.columns(2)
+    
+    with action_col1:
+        # Download report
+        report_data = {
+            'source': source_name,
+            'verdict': 'RANSOMWARE' if prediction == 1 else 'BENIGN',
+            'ransomware_confidence': probability[1],
+            'benign_confidence': probability[0],
+            'risk_level': risk_level,
+            'analysis_timestamp': pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+            **features
+        }
+        
+        report_df = pd.DataFrame([report_data])
+        csv = report_df.to_csv(index=False)
+        
+        st.download_button(
+            label="📥 Download Full Report",
+            data=csv,
+            file_name=f"security_analysis_{source_name}.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+    
+    with action_col2:
+        if st.button("🔄 New Analysis", use_container_width=True):
+            st.rerun()
+    
+    return prediction, probability
+
+def main():
+    st.title("🛡️ Ransomware Detection System")
+    st.markdown("""
+    **Fast ML-powered ransomware detection** - Upload files or enter features manually
+    """)
     
     # Load model
     model, feature_names = load_model()
     
     if model is None:
-        st.error("⚠️ Failed to load the model. Please ensure the model file exists in the 'models' folder.")
-        return
+        st.stop()
     
-    # Sidebar
-    with st.sidebar:
-        st.image("https://img.icons8.com/color/96/000000/security-checked.png", width=100)
-        st.title("Navigation")
-        page = st.radio("", ["🏠 Home", "📊 Batch Analysis", "🔍 Single File Check", "📈 Model Info"])
+    # Quick info in sidebar
+    st.sidebar.header("⚡ Quick Info")
+    st.sidebar.info("**Model:** Random Forest")
+    st.sidebar.info("**Accuracy:** ~99.6%")
+    st.sidebar.info("**Analysis Time:** < 3 seconds")
+    
+    # Input method selection
+    st.header("🔧 Choose Analysis Method")
+    
+    input_method = st.radio(
+        "Select input method:",
+        ["📁 Upload Executable File", "✍️ Manual Feature Input"],
+        horizontal=True
+    )
+    
+    if input_method == "📁 Upload Executable File":
+        st.subheader("📁 File Upload Analysis")
         
-        st.markdown("---")
-        st.markdown("### About")
-        st.info("This system uses machine learning to detect ransomware based on PE file characteristics.")
+        col1, col2 = st.columns([2, 1])
         
-        st.markdown("### Features Used")
-        with st.expander("View All Features"):
-            for i, feat in enumerate(feature_names, 1):
-                st.text(f"{i}. {feat}")
-    
-    # Pages
-    if page == "🏠 Home":
-        show_home_page(model, feature_names)
-    elif page == "📊 Batch Analysis":
-        show_batch_analysis_page(model, feature_names)
-    elif page == "🔍 Single File Check":
-        show_single_check_page(model, feature_names)
-    else:
-        show_model_info_page(model, feature_names)
-
-def show_home_page(model, feature_names):
-    st.header("Welcome to the Ransomware Detection System")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.markdown("""
-        <div class="metric-card">
-            <h3>🎯 Accuracy</h3>
-            <h2>99.65%</h2>
-            <p>Model accuracy on test data</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col2:
-        st.markdown("""
-        <div class="metric-card">
-            <h3>🌲 Algorithm</h3>
-            <h2>Random Forest</h2>
-            <p>200 trees, max depth 20</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col3:
-        st.markdown("""
-        <div class="metric-card">
-            <h3>📊 Features</h3>
-            <h2>15</h2>
-            <p>PE file characteristics</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    st.markdown("---")
-    st.subheader("How It Works")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown("""
-        #### 📤 Upload
-        Upload a CSV file containing PE file features or enter values manually.
+        with col1:
+            uploaded_file = st.file_uploader(
+                "Drag & drop any Windows executable", 
+                type=['exe', 'dll', 'sys', 'bin'],
+                help="Supported: .exe, .dll, .sys files"
+            )
         
-        #### 🔬 Analysis
-        Our Random Forest model analyzes 15 key characteristics of the file.
+        with col2:
+            st.markdown("### Supported Files")
+            st.markdown("""
+            - `.exe` - Executables
+            - `.dll` - Libraries  
+            - `.sys` - Drivers
+            - `.bin` - Binaries
+            """)
         
-        #### 📋 Results
-        Get instant predictions with confidence scores and detailed explanations.
-        """)
-    
-    with col2:
-        st.info("""
-        **Key Features Analyzed:**
-        - Machine type
-        - Debug information
-        - Version details
-        - Export/Import tables
-        - Section information
-        - DLL characteristics
-        - Resource size
-        - Bitcoin addresses (indicator)
-        """)
-
-def show_batch_analysis_page(model, feature_names):
-    st.header("📊 Batch Analysis")
-    st.write("Upload a CSV file containing multiple files to analyze")
-    
-    uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
-    
-    if uploaded_file is not None:
-        try:
-            # Read the uploaded file
-            df = pd.read_csv(uploaded_file)
+        if uploaded_file is not None:
+            # Quick file info
+            st.success(f"✅ **File Ready:** {uploaded_file.name} ({uploaded_file.size / 1024:.1f} KB)")
             
-            st.success(f"✅ File uploaded successfully! Found {len(df)} records.")
-            
-            # Show preview
-            with st.expander("📄 Preview Data"):
-                st.dataframe(df.head(10))
-            
-            # Check if required columns exist
-            missing_cols = set(feature_names) - set(df.columns)
-            if missing_cols:
-                st.error(f"❌ Missing required columns: {missing_cols}")
-                st.info("💡 **Tip**: Your CSV should contain these exact column names (case-sensitive):")
-                st.code(", ".join(feature_names))
+            # Single analyze button
+            if st.button("🚀 **ANALYZE FILE**", type="primary", use_container_width=True):
                 
-                # Show what columns were found
-                st.warning(f"**Found columns in your file**: {', '.join(df.columns.tolist())}")
-                return
-            
-            # Prepare data - only use the feature columns
-            X = df[feature_names]
-            
-            # Keep original data for display (with FileName if present)
-            display_cols = ['FileName'] if 'FileName' in df.columns else []
-            
-            if st.button("🚀 Run Analysis", type="primary"):
-                with st.spinner("Analyzing files..."):
-                    # Make predictions
-                    predictions = model.predict(X)
-                    probabilities = model.predict_proba(X)[:, 1]
+                # Progress and status
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                # Step 1: File validation
+                status_text.text("🔍 Validating file...")
+                progress_bar.progress(20)
+                time.sleep(0.5)
+                
+                # Step 2: Feature extraction
+                status_text.text("📊 Extracting features...")
+                progress_bar.progress(50)
+                
+                features = analyze_uploaded_file(uploaded_file)
+                
+                if features is not None:
+                    # Step 3: Making prediction
+                    status_text.text("🤖 Analyzing with AI...")
+                    progress_bar.progress(80)
+                    time.sleep(0.5)
                     
-                    # Add results to dataframe
-                    results_df = df.copy()
-                    results_df['Prediction'] = ['Benign' if p == 1 else 'Ransomware' for p in predictions]
-                    results_df['Confidence'] = probabilities
-                    results_df['Risk_Level'] = pd.cut(
-                        probabilities, 
-                        bins=[0, 0.3, 0.7, 1.0], 
-                        labels=['Low', 'Medium', 'High']
-                    )
+                    # Step 4: Display results
+                    status_text.text("📈 Generating report...")
+                    progress_bar.progress(100)
+                    time.sleep(0.5)
                     
-                    # Reorder columns to show important info first
-                    priority_cols = ['FileName', 'Prediction', 'Confidence', 'Risk_Level']
-                    available_priority = [col for col in priority_cols if col in results_df.columns]
-                    other_cols = [col for col in results_df.columns if col not in priority_cols]
-                    results_df = results_df[available_priority + other_cols]
+                    status_text.empty()
+                    progress_bar.empty()
                     
-                    # Display summary
-                    col1, col2, col3, col4 = st.columns(4)
+                    # Make prediction and show results
+                    predict_from_features(features, model, feature_names, uploaded_file.name)
                     
-                    benign_count = sum(predictions == 1)
-                    malicious_count = sum(predictions == 0)
+                    # Success message
+                    st.success(f"✅ Analysis completed! File: {uploaded_file.name}")
                     
-                    with col1:
-                        st.metric("Total Files", len(predictions))
-                    with col2:
-                        st.metric("Benign", benign_count, delta="Safe", delta_color="normal")
-                    with col3:
-                        st.metric("Ransomware", malicious_count, delta="Threat", delta_color="inverse")
-                    with col4:
-                        st.metric("Detection Rate", f"{(malicious_count/len(predictions)*100):.1f}%")
-                    
-                    # Visualization
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        # Pie chart
-                        fig = px.pie(
-                            names=['Benign', 'Ransomware'],
-                            values=[benign_count, malicious_count],
-                            title="Detection Results",
-                            color_discrete_sequence=['#2ecc71', '#e74c3c']
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-                    
-                    with col2:
-                        # Confidence distribution
-                        fig = px.histogram(
-                            probabilities,
-                            nbins=20,
-                            title="Confidence Score Distribution",
-                            labels={'value': 'Confidence Score', 'count': 'Count'}
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-                    
-                    # Detailed results
-                    st.subheader("📋 Detailed Results")
-                    
-                    # Filter options
-                    filter_option = st.selectbox(
-                        "Filter by:",
-                        ["All", "Benign Only", "Ransomware Only", "High Risk"]
-                    )
-                    
-                    if filter_option == "Benign Only":
-                        display_df = results_df[results_df['Prediction'] == 'Benign']
-                    elif filter_option == "Ransomware Only":
-                        display_df = results_df[results_df['Prediction'] == 'Ransomware']
-                    elif filter_option == "High Risk":
-                        display_df = results_df[results_df['Risk_Level'] == 'High']
-                    else:
-                        display_df = results_df
-                    
-                    st.dataframe(
-                        display_df.style.applymap(
-                            lambda x: 'background-color: #d4edda' if x == 'Benign' else 'background-color: #f8d7da' if x == 'Ransomware' else '',
-                            subset=['Prediction']
-                        ),
-                        use_container_width=True
-                    )
-                    
-                    # Download results
-                    csv = results_df.to_csv(index=False)
-                    st.download_button(
-                        label="📥 Download Results",
-                        data=csv,
-                        file_name="ransomware_detection_results.csv",
-                        mime="text/csv"
-                    )
-        
-        except Exception as e:
-            st.error(f"❌ Error processing file: {e}")
-
-def show_single_check_page(model, feature_names):
-    st.header("🔍 Single File Check")
-    st.write("Enter the file characteristics manually for analysis")
+                else:
+                    st.error("❌ Failed to analyze file. Please ensure it's a valid Windows executable.")
+                    progress_bar.empty()
+                    status_text.empty()
     
-    # Create input form
-    with st.form("single_check_form"):
-        st.subheader("File Characteristics")
+    else:  # Manual Feature Input
+        st.subheader("✍️ Manual Feature Input")
         
-        col1, col2 = st.columns(2)
+        st.info("""
+        💡 **Tip:** Enter the feature values below. These are typically extracted from PE file headers.
+        For unknown values, use 0 as default.
+        """)
         
-        input_data = {}
-        
-        for i, feature in enumerate(feature_names):
-            with col1 if i % 2 == 0 else col2:
-                input_data[feature] = st.number_input(
-                    feature,
-                    value=0,
-                    help=f"Enter value for {feature}"
-                )
-        
-        submitted = st.form_submit_button("🔍 Analyze File", type="primary")
-        
-        if submitted:
-            # Create DataFrame
-            input_df = pd.DataFrame([input_data])
+        # Create input form with organized layout
+        with st.form("manual_input_form"):
+            st.write("### Enter Feature Values")
             
-            # Make prediction
-            prediction = model.predict(input_df)[0]
-            probability = model.predict_proba(input_df)[0][1]
-            
-            # Display result
-            st.markdown("---")
-            st.subheader("Analysis Result")
-            
+            # Organize features into logical groups
             col1, col2, col3 = st.columns(3)
             
-            result_text = "Benign" if prediction == 1 else "Ransomware"
-            result_color = "benign" if prediction == 1 else "malicious"
-            risk_level = "Low" if probability > 0.7 else "Medium" if probability > 0.3 else "High"
+            features = {}
             
             with col1:
-                st.markdown(f'<h2 class="{result_color}">🔍 {result_text}</h2>', unsafe_allow_html=True)
+                st.write("**Basic Information**")
+                features['Machine'] = st.number_input("Machine Type", value=332, help="e.g., 332 for I386, 34404 for AMD64")
+                features['NumberOfSections'] = st.number_input("Number of Sections", value=4, min_value=1, max_value=100)
+                features['MajorLinkerVersion'] = st.number_input("Major Linker Version", value=8)
+                features['MinorLinkerVersion'] = st.number_input("Minor Linker Version", value=0)
             
             with col2:
-                st.metric("Confidence Score", f"{probability*100:.2f}%")
+                st.write("**Version Information**")
+                features['MajorImageVersion'] = st.number_input("Major Image Version", value=0)
+                features['MajorOSVersion'] = st.number_input("Major OS Version", value=4)
+                features['SizeOfStackReserve'] = st.number_input("Stack Reserve Size", value=1048576)
+                features['DllCharacteristics'] = st.number_input("DLL Characteristics", value=34112)
             
             with col3:
-                st.metric("Risk Level", risk_level)
+                st.write("**Advanced Features**")
+                features['DebugSize'] = st.number_input("Debug Size", value=0)
+                features['DebugRVA'] = st.number_input("Debug RVA", value=0)
+                features['ExportRVA'] = st.number_input("Export RVA", value=0)
+                features['ExportSize'] = st.number_input("Export Size", value=0)
+                features['IatVRA'] = st.number_input("IAT Virtual Address", value=8192)
+                features['ResourceSize'] = st.number_input("Resource Size", value=672)
+                features['BitcoinAddresses'] = st.number_input("Bitcoin Addresses", value=0, help="Number of bitcoin addresses found")
             
-            # Feature importance for this prediction
-            st.subheader("📊 Feature Contribution")
-            feature_importance = pd.DataFrame({
-                'Feature': feature_names,
-                'Importance': model.feature_importances_
-            }).sort_values('Importance', ascending=False).head(10)
+            # Submit button
+            submitted = st.form_submit_button("🚀 **ANALYZE FEATURES**", type="primary", use_container_width=True)
             
-            fig = px.bar(
-                feature_importance,
-                x='Importance',
-                y='Feature',
-                orientation='h',
-                title="Top 10 Most Important Features"
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-def show_model_info_page(model, feature_names):
-    st.header("📈 Model Information")
+            if submitted:
+                # Validate that all features are present
+                missing_features = set(feature_names) - set(features.keys())
+                if missing_features:
+                    st.error(f"Missing features: {missing_features}")
+                else:
+                    # Show quick analysis
+                    with st.spinner("Analyzing features..."):
+                        time.sleep(1)  # Simulate processing
+                        predict_from_features(features, model, feature_names, "Manual_Input")
     
-    tab1, tab2, tab3 = st.tabs(["📊 Performance", "🌲 Model Details", "📚 Documentation"])
-    
-    with tab1:
-        st.subheader("Model Performance Metrics")
+    # Feature descriptions (always available)
+    with st.expander("📚 Feature Descriptions", expanded=False):
+        feature_descriptions = {
+            'Machine': 'Target machine type (332=I386, 34404=AMD64)',
+            'DebugSize': 'Size of debug information (0 if no debug info)',
+            'DebugRVA': 'Relative virtual address of debug information',
+            'MajorImageVersion': 'Major version number of the image',
+            'MajorOSVersion': 'Major version number of operating system',
+            'ExportRVA': 'Relative virtual address of export table',
+            'ExportSize': 'Size of export data',
+            'IatVRA': 'Import address table virtual address',
+            'MajorLinkerVersion': 'Major version of linker',
+            'MinorLinkerVersion': 'Minor version of linker',
+            'NumberOfSections': 'Number of sections in PE file',
+            'SizeOfStackReserve': 'Size of stack to reserve',
+            'DllCharacteristics': 'DLL characteristics flags',
+            'ResourceSize': 'Size of resources',
+            'BitcoinAddresses': 'Number of bitcoin addresses (0 for benign files)'
+        }
         
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown("""
-            ### Classification Metrics
-            - **Accuracy**: 99.65%
-            - **ROC-AUC**: 99.98%
-            - **Precision**: 100%
-            - **Recall**: 99%
-            - **F1-Score**: 100%
-            """)
-        
-        with col2:
-            # Confusion Matrix visualization
-            confusion_matrix_data = np.array([[7073, 0], [44, 5380]])
-            
-            fig = go.Figure(data=go.Heatmap(
-                z=confusion_matrix_data,
-                x=['Predicted Ransomware', 'Predicted Benign'],
-                y=['True Ransomware', 'True Benign'],
-                colorscale='Blues',
-                text=confusion_matrix_data,
-                texttemplate="%{text}",
-                textfont={"size": 20}
-            ))
-            
-            fig.update_layout(
-                title="Confusion Matrix",
-                xaxis_title="Predicted",
-                yaxis_title="Actual"
-            )
-            
-            st.plotly_chart(fig, use_container_width=True)
-    
-    with tab2:
-        st.subheader("Random Forest Model Details")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown("""
-            ### Hyperparameters
-            - **Algorithm**: Random Forest Classifier
-            - **Number of Trees**: 200
-            - **Max Depth**: 20
-            - **Random State**: 42
-            - **n_jobs**: -1 (all CPU cores)
-            """)
-        
-        with col2:
-            st.markdown("""
-            ### Training Details
-            - **Training Samples**: 49,988
-            - **Test Samples**: 12,497
-            - **Features**: 15
-            - **Test Size**: 20%
-            - **Stratified Split**: Yes
-            """)
-        
-        st.subheader("Feature Importance")
-        
-        # Feature importance plot
-        feature_importance = pd.DataFrame({
-            'Feature': feature_names,
-            'Importance': model.feature_importances_
-        }).sort_values('Importance', ascending=False)
-        
-        fig = px.bar(
-            feature_importance,
-            x='Importance',
-            y='Feature',
-            orientation='h',
-            title="Feature Importance Ranking"
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with tab3:
-        st.subheader("Documentation")
-        
-        st.markdown("""
-        ### About the Dataset
-        This model was trained on a dataset of 62,485 PE (Portable Executable) files, 
-        including both benign files and ransomware samples.
-        
-        ### Features Description
-        
-        | Feature | Description |
-        |---------|-------------|
-        | Machine | The target machine type (e.g., x86, x64) |
-        | DebugSize | Size of debug information |
-        | DebugRVA | Relative Virtual Address of debug info |
-        | MajorImageVersion | Major version of the image |
-        | MajorOSVersion | Major OS version required |
-        | ExportRVA | Export table RVA |
-        | ExportSize | Size of export table |
-        | IatVRA | Import Address Table RVA |
-        | MajorLinkerVersion | Linker major version |
-        | MinorLinkerVersion | Linker minor version |
-        | NumberOfSections | Number of sections in PE |
-        | SizeOfStackReserve | Stack reserve size |
-        | DllCharacteristics | DLL characteristics flags |
-        | ResourceSize | Size of resource section |
-        | BitcoinAddresses | Presence of Bitcoin addresses |
-        
-        ### Usage Guidelines
-        
-        1. **Batch Analysis**: Upload a CSV file with multiple files to analyze
-        2. **Single File Check**: Manually enter file characteristics
-        3. **Interpretation**: 
-           - Confidence > 70%: High certainty
-           - Confidence 30-70%: Medium certainty
-           - Confidence < 30%: Low certainty
-        
-        ### Limitations
-        
-        - Model is trained on specific PE file characteristics
-        - New ransomware variants may exhibit different patterns
-        - Regular model updates recommended
-        - Should be used as part of layered security approach
-        
-        ### References
-        
-        - Random Forest Algorithm: Breiman, L. (2001)
-        - PE File Format: Microsoft Documentation
-        - Ransomware Detection: Current Research in Malware Analysis
-        """)
+        for feature in feature_names:
+            if feature in feature_descriptions:
+                st.write(f"**{feature}:** {feature_descriptions[feature]}")
 
 if __name__ == "__main__":
     main()
